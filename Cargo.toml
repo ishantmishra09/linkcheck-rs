@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+colored = "3.1.1"
 reqwest = { version = "0.13.4", features = ["blocking"] }
 thiserror = "2.0.20"
 url = "2.5.8"
