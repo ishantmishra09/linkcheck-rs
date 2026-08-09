@@ -1,4 +1,7 @@
-#![allow(unused)]
+mod cli;
+mod error;
+mod request;
+mod types;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -6,10 +9,6 @@ use colored::Colorize;
 use url::Url;
 
 use crate::{cli::Cli, error::AppError, types::CrawlConfig};
-
-mod cli;
-mod error;
-mod types;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
