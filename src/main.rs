@@ -25,18 +25,24 @@ fn main() -> Result<()> {
         return Err(AppError::MissingHost(root.to_string()).into());
     }
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cli.threads)
-        .build_global()
-        .map_err(|e| AppError::Threadpool(e.to_string()))
-        .context("failed to initialize rayon thread pool")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cli.worker_threads.max(1))
+        .enable_all()
+        .build()
+        .map_err(|e| AppError::Runtime(e.to_string()))
+        .context("failed to start tokio runtime")?;
 
+    runtime.block_on(run(cli, root))
+}
+
+async fn run(cli: Cli, root: Url) -> Result<()> {
     let config = CrawlConfig {
         root: root.clone(),
         max_depth: cli.depth,
         timeout_secs: cli.timeout,
         user_agent: cli.user_agent,
         check_extern: !cli.no_extern,
+        concurrency: cli.concurrency,
     };
 
     println!(
@@ -46,14 +52,14 @@ fn main() -> Result<()> {
         root.as_str().cyan()
     );
     println!(
-        "depth={} threads={} timeout={}s external={}\n",
-        config.max_depth, cli.threads, config.timeout_secs, config.check_extern,
+        "depth={} concurrency={} timeout={}s external={}\n",
+        config.max_depth, cli.concurrency, config.timeout_secs, config.check_extern,
     );
 
     let crawler = Crawler::new(config).context("failed to set up crawler")?;
-    let summary = crawler.run();
+    let summary = crawler.run().await;
 
-    let mut results = crawler.results();
+    let mut results = crawler.results().await;
     results.sort_by(|a, b| a.found_on.as_str().cmp(b.found_on.as_str()));
 
     for result in &results {

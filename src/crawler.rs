@@ -1,8 +1,9 @@
-use std::{collections::HashSet, sync::Mutex};
+use std::collections::HashSet;
 
-use rayon::prelude::*;
-use reqwest::blocking::Client;
+use futures::{StreamExt, future::BoxFuture, stream};
+use reqwest::Client;
 use scraper::{Html, Selector};
+use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
 use crate::{
@@ -17,11 +18,14 @@ pub struct Crawler {
     visited_pages: Mutex<HashSet<Url>>,
     checked_links: Mutex<HashSet<Url>>,
     results: Mutex<Vec<LinkResult>>,
+    semaphore: Semaphore,
 }
 
 impl Crawler {
     pub fn new(config: CrawlConfig) -> Result<Self, AppError> {
         let client = build_client(&config.user_agent, config.timeout_secs)?;
+
+        let semaphore = Semaphore::new(config.concurrency.max(1));
 
         Ok(Crawler {
             config,
@@ -29,13 +33,14 @@ impl Crawler {
             visited_pages: Mutex::new(HashSet::new()),
             checked_links: Mutex::new(HashSet::new()),
             results: Mutex::new(Vec::new()),
+            semaphore,
         })
     }
 
-    pub fn run(&self) -> CrawlSummary {
-        self.crawl_page(self.config.root.clone(), 0);
+    pub async fn run(&self) -> CrawlSummary {
+        self.crawl_page(self.config.root.clone(), 0).await;
 
-        let results = self.results.lock().expect("results mutex poisoned");
+        let results = self.results.lock().await;
         let broken = results.iter().filter(|r| r.status.is_broken()).count();
         let skipped = results
             .iter()
@@ -43,71 +48,80 @@ impl Crawler {
             .count();
 
         CrawlSummary {
-            pages_visited: self
-                .visited_pages
-                .lock()
-                .expect("visited mutex poisoned")
-                .len(),
+            pages_visited: self.visited_pages.lock().await.len(),
             total_checked: results.len(),
             broken,
             skipped,
         }
     }
 
-    pub fn results(&self) -> Vec<LinkResult> {
-        self.results.lock().expect("results mutex poisoned").clone()
+    pub async fn results(&self) -> Vec<LinkResult> {
+        self.results.lock().await.clone()
     }
 
-    fn crawl_page(&self, page_url: Url, depth: usize) {
-        // Prevent crawling the same page more than once
-        if !self.mark_visited(&page_url) {
-            return;
-        }
+    fn crawl_page(&self, page_url: Url, depth: usize) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.mark_visited(&page_url).await {
+                return;
+            }
 
-        let Ok(body) = self
-            .client
+            let Some(body) = self.fetch_body(&page_url).await else {
+                return;
+            };
+
+            let links = extract_links(&body, &page_url);
+
+            let new_links: Vec<Url> = stream::iter(links)
+                .filter_map(|link| async move {
+                    if self.mark_link_checked(&link).await {
+                        Some(link)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+                .await;
+
+            let checked: Vec<LinkResult> = stream::iter(new_links)
+                .map(|link| self.check_one(link, page_url.clone()))
+                .buffer_unordered(self.config.concurrency)
+                .collect()
+                .await;
+
+            let to_recurse: Vec<Url> = if depth < self.config.max_depth {
+                checked
+                    .iter()
+                    .filter(|r| r.kind == LinkKind::Internal && !r.status.is_broken())
+                    .map(|r| r.url.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            self.results.lock().await.extend(checked);
+
+            stream::iter(to_recurse)
+                .for_each_concurrent(self.config.concurrency, |next| {
+                    self.crawl_page(next, depth + 1)
+                })
+                .await;
+        })
+    }
+
+    async fn fetch_body(&self, page_url: &Url) -> Option<String> {
+        let _permit = self.semaphore.acquire().await.ok()?;
+        self.client
             .get(page_url.clone())
             .send()
-            .and_then(|r| r.text())
-        else {
-            return;
-        };
-
-        let links = extract_links(&body, &page_url);
-
-        // only check links that have not already been checked globally.
-        let new_links: Vec<Url> = links
-            .into_iter()
-            .filter(|link| self.mark_link_checked(link))
-            .collect();
-
-        let checked: Vec<LinkResult> = new_links
-            .par_iter()
-            .map(|link| self.check_one(link, &page_url))
-            .collect();
-
-        let to_recurse: Vec<Url> = if depth < self.config.max_depth {
-            checked
-                .iter()
-                .filter(|r| r.kind == LinkKind::Internal && !r.status.is_broken())
-                .map(|r| r.url.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        self.results
-            .lock()
-            .expect("results mutex poisoned")
-            .extend(checked);
-
-        to_recurse
-            .into_par_iter()
-            .for_each(|next| self.crawl_page(next, depth + 1));
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()
     }
 
-    fn check_one(&self, link: &Url, page_url: &Url) -> LinkResult {
-        let kind = classify(link, &self.config.root);
+    async fn check_one(&self, link: Url, page_url: Url) -> LinkResult {
+        let kind = classify(&link, &self.config.root);
 
         if kind == LinkKind::External && !self.config.check_extern {
             return LinkResult {
@@ -118,21 +132,20 @@ impl Crawler {
             };
         }
 
-        check_link(&self.client, link, page_url, kind)
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .expect("semaphore never closed");
+        check_link(&self.client, &link, &page_url, kind).await
     }
 
-    fn mark_visited(&self, url: &Url) -> bool {
-        self.visited_pages
-            .lock()
-            .expect("visited mutex poisoned")
-            .insert(url.clone())
+    async fn mark_visited(&self, url: &Url) -> bool {
+        self.visited_pages.lock().await.insert(url.clone())
     }
 
-    fn mark_link_checked(&self, url: &Url) -> bool {
-        self.checked_links
-            .lock()
-            .expect("checked links mutex poisoned")
-            .insert(url.clone())
+    async fn mark_link_checked(&self, url: &Url) -> bool {
+        self.checked_links.lock().await.insert(url.clone())
     }
 }
 

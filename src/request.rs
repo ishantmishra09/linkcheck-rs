@@ -1,4 +1,4 @@
-use reqwest::blocking::{Client, Response};
+use reqwest::{Client, Response};
 use url::Url;
 
 use crate::{
@@ -22,8 +22,8 @@ pub fn classify(link: &Url, root: &Url) -> LinkKind {
     }
 }
 
-pub fn check_link(client: &Client, link: &Url, found_on: &Url, kind: LinkKind) -> LinkResult {
-    let status = match probe(client, link) {
+pub async fn check_link(client: &Client, link: &Url, found_on: &Url, kind: LinkKind) -> LinkResult {
+    let status = match probe(client, link).await {
         Ok(code) if (200..400).contains(&code) => LinkStatus::Ok(code),
         Ok(code) => LinkStatus::Broken(code),
         Err(e) => LinkStatus::Failed(describe(&e)),
@@ -37,22 +37,22 @@ pub fn check_link(client: &Client, link: &Url, found_on: &Url, kind: LinkKind) -
     }
 }
 
-fn probe(client: &Client, link: &Url) -> Result<u16, AppError> {
-    match client.head(link.clone()).send() {
+async fn probe(client: &Client, link: &Url) -> Result<u16, AppError> {
+    match client.head(link.clone()).send().await {
         Ok(resp) => {
             let code = resp.status().as_u16();
             if code == 405 || code == 501 {
-                get_status(client, link)
+                get_status(client, link).await
             } else {
                 Ok(code)
             }
         }
-        Err(_) => get_status(client, link),
+        Err(_) => get_status(client, link).await,
     }
 }
 
-fn get_status(client: &Client, link: &Url) -> Result<u16, AppError> {
-    let resp: Response = client.get(link.clone()).send()?;
+async fn get_status(client: &Client, link: &Url) -> Result<u16, AppError> {
+    let resp: Response = client.get(link.clone()).send().await?;
     Ok(resp.status().as_u16())
 }
 

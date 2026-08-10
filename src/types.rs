@@ -67,6 +67,7 @@ pub struct CrawlConfig {
     pub timeout_secs: u64,
     pub user_agent: String,
     pub check_extern: bool,
+    pub concurrency: usize,
 }
 
 impl Default for CrawlConfig {
@@ -77,6 +78,7 @@ impl Default for CrawlConfig {
             timeout_secs: 10,
             user_agent: format!("linkcheck-rs/{}", env!("CARGO_PKG_VERSION")),
             check_extern: true,
+            concurrency: 32,
         }
     }
 }
